@@ -1,8 +1,8 @@
 Package: com.yourname.alarmpill
-Name: AlarmPill Probe
-Version: 0.0.1
+Name: Hide Sleep Alarm Pill
+Version: 0.0.2
 Architecture: iphoneos-arm64
-Description: Diagnostic probe to dump iOS 17 lock screen alarm pill view hierarchy (RootHide).
+Description: Hide the lock screen sleep alarm pill below the clock on iOS 17 (RootHide).
 Maintainer: YourName
 Author: YourName
 Section: Tweaks

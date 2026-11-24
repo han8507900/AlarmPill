@@ -1,86 +1,77 @@
 #import <UIKit/UIKit.h>
 #include <objc/runtime.h>
 
-@interface SpringBoard : UIApplication
-@end
+static NSString *const AxsHideAlarmPillLogPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
+static char AxsHideAlarmPillSigKey;
 
-static NSString *PillDumpPath(void) {
-    return @"/var/mobile/Documents/AlarmPillDump.txt";
+static void AxsHideAlarmPillWrite(NSString *msg) {
+    NSString *line = [msg stringByAppendingString:@"\n"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsHideAlarmPillLogPath];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:AxsHideAlarmPillLogPath atomically:YES
+                 encoding:NSUTF8StringEncoding error:nil];
+    }
 }
 
-static void WalkView(UIView *view, int depth, NSMutableString *out) {
-    if (!view) return;
+// 时间下方的闹钟 element：dump 已确认 slot 是 CSProminentEmptyElementView
+// (frame y=140,h=72)，闹钟显示时通常替换为 CSProminentLabeledElementView。
+static BOOL AxsHideAlarmPillIsTarget(NSString *cls) {
+    return [cls hasPrefix:@"CSProminent"] &&
+           ([cls containsString:@"Labeled"] ||
+            [cls containsString:@"Alarm"] ||
+            [cls containsString:@"Empty"]);
+}
 
+static void AxsHideAlarmPillCollect(UIView *view, NSMutableString *sig, NSMutableArray *found) {
     NSString *cls = NSStringFromClass([view class]);
-    CGRect f = view.frame;
-    BOOL hidden = view.hidden;
-    CGFloat alpha = view.alpha;
-
-    NSString *text = @"";
-    if ([view isKindOfClass:[UILabel class]]) {
-        text = ((UILabel *)view).text ?: @"";
+    if ([cls hasPrefix:@"CSProminent"]) {
+        [sig appendFormat:@"%@,", cls];
     }
-
-    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
-    [out appendFormat:@"%@%@ frame=(%.0f,%.0f,%.0f,%.0f) hidden=%d alpha=%.2f text='%@'\n",
-        pad, cls, f.origin.x, f.origin.y, f.size.width, f.size.height, hidden, alpha, text];
-
+    if (AxsHideAlarmPillIsTarget(cls)) {
+        [found addObject:view];
+    }
     for (UIView *sub in view.subviews) {
-        WalkView(sub, depth + 1, out);
+        AxsHideAlarmPillCollect(sub, sig, found);
     }
 }
 
-static void DumpLockScreen(void) {
-    NSMutableString *out = [NSMutableString stringWithString:@"=== AlarmPill Probe v1 ===\n"];
-    [out appendString:@"Device: iPhone / iOS 17.3.1 / RootHide\n\n"];
+%hook CSProminentDisplayView
 
-    UIApplication *app = [UIApplication sharedApplication];
-    NSMutableArray *windows = [NSMutableArray array];
-    for (UIScene *scene in app.connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            [windows addObjectsFromArray:((UIWindowScene *)scene).windows];
+- (void)layoutSubviews {
+    %orig;
+
+    NSMutableString *sig = [NSMutableString string];
+    NSMutableArray *found = [NSMutableArray array];
+    AxsHideAlarmPillCollect(self, sig, found);
+
+    // 视图树变化时记一次，便于确认闹钟胶囊的真实类名
+    NSString *old = objc_getAssociatedObject(self, &AxsHideAlarmPillSigKey);
+    if (![old isEqualToString:sig]) {
+        objc_setAssociatedObject(self, &AxsHideAlarmPillSigKey, sig, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        AxsHideAlarmPillWrite([NSString stringWithFormat:@"tree: %@", sig]);
+    }
+
+    for (UIView *v in found) {
+        if (!v.hidden) {
+            v.hidden = YES;
+            AxsHideAlarmPillWrite([NSString stringWithFormat:@"hidden %@", NSStringFromClass([v class])]);
         }
     }
-
-    [out appendFormat:@"Windows found: %lu\n\n", (unsigned long)windows.count];
-    for (UIWindow *w in windows) {
-        [out appendFormat:@"--- WINDOW %@ frame=(%.0f,%.0f,%.0f,%.0f) hidden=%d ---\n",
-            NSStringFromClass([w class]), w.frame.origin.x, w.frame.origin.y,
-            w.frame.size.width, w.frame.size.height, w.hidden];
-        WalkView(w, 1, out);
-        [out appendString:@"\n"];
-    }
-
-    [out appendString:@"=== END ===\n"];
-
-    NSString *path = PillDumpPath();
-    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    pb.string = out;
 }
 
-static void OnLockComplete(CFNotificationCenterRef center, void *observer,
-                           CFStringRef name, const void *object,
-                           CFDictionaryRef userInfo) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
-        DumpLockScreen();
-    });
-}
+%end
 
-%hook SpringBoard
-
-- (void)applicationDidFinishLaunching:(id)application {
+// 兜底：部分 iOS 版本胶囊不走 CSProminentDisplayView 子树
+%hook CSProminentLabeledElementView
+- (void)layoutSubviews {
     %orig;
-    CFNotificationCenterAddObserver(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        NULL,
-        &OnLockComplete,
-        CFSTR("com.apple.springboard.lockcomplete"),
-        NULL,
-        CFNotificationSuspensionBehaviorDeliverImmediately
-    );
+    if (!self.hidden) {
+        self.hidden = YES;
+        AxsHideAlarmPillWrite(@"hidden labeled-direct");
+    }
 }
-
 %end
