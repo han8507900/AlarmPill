@@ -61,4 +61,44 @@ static void DumpLockScreen(void) {
     }
 
     [out appendFormat:@"Windows found: %lu\n\n", (unsigned long)windows.count];
-    for (UIWindow *w in
+    for (UIWindow *w in windows) {
+        [out appendFormat:@"--- WINDOW %@ frame=(%.0f,%.0f,%.0f,%.0f) hidden=%d ---\n",
+            NSStringFromClass([w class]), w.frame.origin.x, w.frame.origin.y,
+            w.frame.size.width, w.frame.size.height, w.hidden];
+        WalkView(w, 1, out);
+        [out appendString:@"\n"];
+    }
+
+    [out appendString:@"=== END ===\n"];
+
+    NSString *path = PillDumpPath();
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    pb.string = out;
+}
+
+static void OnLockComplete(CFNotificationCenterRef center, void *observer,
+                           CFStringRef name, const void *object,
+                           CFDictionaryRef userInfo) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        DumpLockScreen();
+    });
+}
+
+%hook SpringBoard
+
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL,
+        &OnLockComplete,
+        CFSTR("com.apple.springboard.lockcomplete"),
+        NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately
+    );
+}
+
+%end
