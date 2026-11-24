@@ -4,197 +4,149 @@
 @end
 
 // ============================================================================
-// 方案 v5：全锁屏持续扫描（不再局限于时钟区，不再靠点击时机）
+// 方案 v6：精准隐藏「锁屏时间下方的闹钟胶囊」
 //
-// 教训：
-//  1) 之前只 dump CSProminentDisplayView（时钟区），但闹钟胶囊挂在 CoverSheet
-//     的其他容器下（本次抓到的是 LockPlayerContainerView / CSFixedFooterView 那棵）。
-//  2) 点击后延迟抓取会抓到"锁屏上滑收起"的负坐标状态。
-//  3) 定时扫描在熄屏时被暂停——但屏幕亮着（用户看胶囊）时定时器是运行的。
+// 真机 dump 实锤的视图结构（9 次扫描一致）：
+//   CSProminentTimeView          大时间
+//   CSProminentSubtitleDateView  日期
+//   CSAdjunctItemView f=(0,214,393,65)   ★ 时间下方的附属项容器
+//     PLPlatterView
+//       CSRemoteContentInlineView
+//         _UIRemoteView          ★ 远程视图，闹钟文字 07:24 在别的进程渲染
 //
-// 新方案：屏幕亮且锁屏时，每 0.5s 扫描整个 SBCoverSheetWindow 的所有视图，
-//   自动标记出"显示时间格式文字"或"含闹钟语义类名"的视图。
-//   结构变化时才追加写日志（避免刷屏），同时把命中行写到剪贴板。
-//   这样只要胶囊在锁屏上显示几秒，就一定会被抓到。
+// 关键结论：胶囊内容走 _UIRemoteView（跨进程），所以遍历 SpringBoard 视图树
+//   永远扫不到 "07:24" 这个文字 —— 这就是之前十几轮全部扑空的根本原因。
+//   正确做法是隐藏 SpringBoard 侧的容器 CSAdjunctItemView 本身。
+//
+// 策略：hook 必定存在的 SpringBoard，用主队列 GCD 定时器持续扫描，
+//   找到 CSAdjunctItemView 直接 hidden。用 GCD 而非 NSTimer 是因为
+//   NSTimer 在锁屏/滚动切到 UITrackingRunLoopMode 后会暂停。
+//   每 0.25s 重复设置，防止系统布局把它重新显示出来。
+//   只碰 CSAdjunctItemView 及其远程子视图，绝对不动时间/日期视图。
 // ============================================================================
 
-static NSString *const AxsDumpPath = @"/var/mobile/Documents/AxsCoverSheetDump.txt";
-static NSString *const AxsMarkPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
-static dispatch_source_t AxsTimerSource = nil;
-static NSString *AxsLastSig = nil;
+static NSString *const AxsLogPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
+static dispatch_source_t AxsTimer = nil;
+static BOOL AxsDidHide = NO;
+static BOOL AxsDidFirstDiag = NO;
+static int AxsTickCount = 0;
 
-static void AxsWriteMark(NSString *line) {
+static void AxsLog(NSString *line) {
     NSString *s = [line stringByAppendingString:@"\n"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsMarkPath];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsLogPath];
     if (fh) {
         [fh seekToEndOfFile];
         [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     } else {
-        [s writeToFile:AxsMarkPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [s writeToFile:AxsLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
 }
 
-static void AxsAppendDump(NSString *text) {
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsDumpPath];
-    if (fh) {
-        [fh seekToEndOfFile];
-        [fh writeData:[text dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } else {
-        [text writeToFile:AxsDumpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
+// 是否是需要隐藏的附属项/远程视图容器
+static BOOL AxsIsTarget(NSString *cls) {
+    return [cls isEqualToString:@"CSAdjunctItemView"] ||
+           [cls isEqualToString:@"CSRemoteContentInlineView"] ||
+           [cls isEqualToString:@"_UIRemoteView"];
 }
 
-// 视图上所有显示文本
-static NSString *AxsViewText(UIView *v) {
-    NSMutableArray *parts = [NSMutableArray array];
-    if ([v isKindOfClass:[UILabel class]]) {
-        UILabel *l = (UILabel *)v;
-        if (l.text.length) [parts addObject:[NSString stringWithFormat:@"text='%@'", l.text]];
-        if (l.attributedText.string.length) {
-            [parts addObject:[NSString stringWithFormat:@"attr='%@'", l.attributedText.string]];
-        }
-    }
-    if ([v isKindOfClass:[UIButton class]]) {
-        NSString *t = [(UIButton *)v currentTitle];
-        if (t.length) [parts addObject:[NSString stringWithFormat:@"btn='%@'", t]];
-    }
-    if (v.accessibilityLabel.length) {
-        [parts addObject:[NSString stringWithFormat:@"aLabel='%@'", v.accessibilityLabel]];
-    }
-    if (v.accessibilityValue.length) {
-        [parts addObject:[NSString stringWithFormat:@"aValue='%@'", v.accessibilityValue]];
-    }
-    return [parts componentsJoinedByString:@" "];
-}
-
-// 文本里是否含 HH:MM / H:MM 时间格式（闹钟时间）
-static BOOL AxsHasTime(NSString *s) {
-    if (s.length < 3) return NO;
-    NSRange colon = [s rangeOfString:@":"];
-    if (colon.location == NSNotFound || colon.location == 0 || colon.location + 2 >= s.length) return NO;
-    NSCharacterSet *d = [NSCharacterSet decimalDigitCharacterSet];
-    unichar before = [s characterAtIndex:colon.location - 1];
-    unichar after  = [s characterAtIndex:colon.location + 1];
-    return [d characterIsMember:before] && [d characterIsMember:after];
-}
-
-// 类名是否含闹钟语义
-static BOOL AxsAlarmName(NSString *cls) {
+// 诊断用的关键词：即使没命中，也把相关的类名记录下来供收敛
+static BOOL AxsDiagKeyword(NSString *cls) {
     NSString *low = [cls lowercaseString];
-    return [low rangeOfString:@"alarm"].location != NSNotFound ||
-           [low rangeOfString:@"wake"].location != NSNotFound ||
-           [low rangeOfString:@"bedtime"].location != NSNotFound;
+    return [low rangeOfString:@"adjunct"].location != NSNotFound ||
+           [low rangeOfString:@"remote"].location != NSNotFound ||
+           [low rangeOfString:@"platter"].location != NSNotFound ||
+           [low rangeOfString:@"inline"].location != NSNotFound;
 }
 
-static NSString *AxsParentChain(UIView *v) {
-    NSMutableArray *a = [NSMutableArray array];
-    UIView *cur = v.superview;
+// 递归隐藏附属项容器及其内部的远程视图；返回本次隐藏的数量
+static int AxsHideAdjunct(UIView *v, NSMutableString *diag) {
     int n = 0;
-    while (cur && n++ < 8) {
-        [a addObject:NSStringFromClass([cur class])];
-        cur = cur.superview;
-    }
-    return [a componentsJoinedByString:@" < "];
-}
-
-static void AxsWalk(UIView *v, int depth, NSMutableString *full,
-                    NSMutableString *hits, NSMutableString *sig, int *hitCount) {
     NSString *cls = NSStringFromClass([v class]);
-    NSString *txt = AxsViewText(v);
-    CGRect f = [v convertRect:v.bounds toView:nil];
-    NSString *pad = [@"" stringByPaddingToLength:depth withString:@" " startingAtIndex:0];
 
-    BOOL timeText = AxsHasTime(txt);
-    BOOL alarmName = AxsAlarmName(cls);
-    BOOL mark = timeText || alarmName;
+    BOOL isTarget = AxsIsTarget(cls);
 
-    NSString *line = [NSString stringWithFormat:@"%@%@%@ f=(%.0f,%.0f,%.0f,%.0f) hid=%d %@\n",
-                      pad, mark ? @"★ " : @"  ", cls,
-                      f.origin.x, f.origin.y, f.size.width, f.size.height, v.hidden, txt];
-    [full appendString:line];
-    [sig appendFormat:@"%@|%@|%@;", cls, NSStringFromCGRect(f), txt];
+    if (isTarget || AxsDiagKeyword(cls)) {
+        CGRect f = [v convertRect:v.bounds toView:nil];
+        [diag appendFormat:@"%@ %@ f=(%.0f,%.0f,%.0f,%.0f) aLabel='%@'\n",
+            isTarget ? @"HIT " : @"see ", cls,
+            f.origin.x, f.origin.y, f.size.width, f.size.height,
+            v.accessibilityLabel ?: @""];
+    }
 
-    if (mark) {
-        (*hitCount)++;
-        [hits appendString:line];
-        [hits appendFormat:@"%@   CHAIN: %@\n", pad, AxsParentChain(v)];
+    if (isTarget) {
+        if (!v.hidden) { v.hidden = YES; n++; }
+        if (v.alpha > 0.0) v.alpha = 0.0;
+        v.userInteractionEnabled = NO;
     }
 
     for (UIView *sub in v.subviews) {
-        AxsWalk(sub, depth + 1, full, hits, sig, hitCount);
+        n += AxsHideAdjunct(sub, diag);
     }
+    return n;
 }
 
 static void AxsTick(void) {
+    AxsTickCount++;
     UIApplication *app = [UIApplication sharedApplication];
 
-    // 只在屏幕亮着且锁屏（有可见 CoverSheet）时扫描
+    // 找到可见的锁屏窗口
     UIWindow *cover = nil;
     for (UIScene *sc in app.connectedScenes) {
         if (![sc isKindOfClass:[UIWindowScene class]]) continue;
         for (UIWindow *w in ((UIWindowScene *)sc).windows) {
             if (w.hidden) continue;
-            NSString *cls = NSStringFromClass([w class]);
-            if ([cls rangeOfString:@"CoverSheet"].location != NSNotFound) { cover = w; break; }
+            NSString *wc = NSStringFromClass([w class]);
+            if ([wc rangeOfString:@"CoverSheet"].location != NSNotFound) {
+                cover = w;
+                break;
+            }
         }
         if (cover) break;
     }
     if (!cover) return;
 
-    NSMutableString *full = [NSMutableString string];
-    NSMutableString *hits = [NSMutableString string];
-    NSMutableString *sig  = [NSMutableString string];
-    int hitCount = 0;
-    [full appendString:@"=== COVERSHEET SCAN ===\n"];
-    AxsWalk(cover, 1, full, hits, sig, &hitCount);
-    [full appendString:@"=== END ===\n"];
+    NSMutableString *diag = [NSMutableString string];
+    int hidden = AxsHideAdjunct(cover, diag);
 
-    // 结构没变化就不重复写
-    if ([AxsLastSig isEqualToString:sig]) return;
-    AxsLastSig = [sig copy];
+    // 首次扫描写一次诊断快照（无论是否命中），供失败时收敛类名
+    if (!AxsDidFirstDiag) {
+        AxsDidFirstDiag = YES;
+        AxsLog(@"=== FIRST SCAN DIAG ===");
+        AxsLog(diag.length ? diag : @"(no adjunct/remote/platter/inline view found)");
+    }
 
-    NSMutableString *block = [NSMutableString string];
-    [block appendFormat:@"\n########## SCAN hit=%d ##########\n", hitCount];
-    [block appendString:full];
-    AxsAppendDump(block);
-
-    // 写剪贴板：命中放前面，后面附完整树，无论如何都能拿到数据
-    NSMutableString *clip = [NSMutableString string];
-    [clip appendFormat:@"=== 闹钟候选 hit=%d ===\n", hitCount];
-    [clip appendString:hits];
-    [clip appendString:@"\n=== 完整树(最后一片) ===\n"];
-    [clip appendString:full];
-    [UIPasteboard generalPasteboard].string = clip;
+    if (hidden > 0 && !AxsDidHide) {
+        AxsDidHide = YES;
+        AxsLog([NSString stringWithFormat:@"=== HIDDEN alarm pill, tick=%d views=%d ===",
+                AxsTickCount, hidden]);
+        AxsLog(diag);
+    }
 }
 
-// 主队列 GCD 定时器：不受 run loop mode 切换影响（NSTimer 在锁屏/滚动时会被
-// 切到 UITrackingRunLoopMode 而暂停），同时保证 UIKit 操作都在主线程。
-static void AxsStartScan(void) {
-    if (AxsTimerSource) return;
-    AxsTimerSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                            dispatch_get_main_queue());
-    dispatch_source_set_timer(AxsTimerSource,
+static void AxsStartTimer(void) {
+    if (AxsTimer) return;
+    AxsTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                      dispatch_get_main_queue());
+    dispatch_source_set_timer(AxsTimer,
                               dispatch_walltime(NULL, 0),
-                              500 * NSEC_PER_MSEC,   // 每 0.5 秒
-                              100 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(AxsTimerSource, ^{
+                              250 * NSEC_PER_MSEC,   // 每 0.25 秒
+                              50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(AxsTimer, ^{
         AxsTick();
     });
-    dispatch_resume(AxsTimerSource);
+    dispatch_resume(AxsTimer);
 }
 
 %hook SpringBoard
 
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    // respring 时清空旧日志
-    [@"" writeToFile:AxsDumpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    AxsWriteMark(@"=== tweak v5 loaded (gcd coversheet scan) ===");
+    [@"" writeToFile:AxsLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    AxsLog(@"=== tweak v6 loaded (adjunct hide) ===");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        AxsStartScan();
+        AxsStartTimer();
     });
 }
 
