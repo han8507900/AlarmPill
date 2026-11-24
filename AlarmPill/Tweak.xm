@@ -1,6 +1,15 @@
 #import <UIKit/UIKit.h>
 #include <objc/runtime.h>
 
+// 显式声明被 hook 的私有类继承自 UIView。
+// Logos 默认只生成 @class 前向声明，编译器不知道它们的父类，
+// 会导致「无法作为 UIView* 传参」和「找不到 hidden 属性」两类编译错误。
+@interface CSProminentDisplayView : UIView
+@end
+
+@interface CSProminentLabeledElementView : UIView
+@end
+
 static NSString *const AxsHideAlarmPillLogPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
 static char AxsHideAlarmPillSigKey;
 
