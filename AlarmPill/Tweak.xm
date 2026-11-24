@@ -7,7 +7,7 @@
 @interface CSProminentDisplayView : UIView
 @end
 
-@interface CSProminentLabeledElementView : UIView
+@interface CSProminentTextElementView : UIView
 @end
 
 static NSString *const AxsHideAlarmPillLogPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
@@ -26,13 +26,10 @@ static void AxsHideAlarmPillWrite(NSString *msg) {
     }
 }
 
-// 时间下方的闹钟 element：dump 已确认 slot 是 CSProminentEmptyElementView
-// (frame y=140,h=72)，闹钟显示时通常替换为 CSProminentLabeledElementView。
+// 真机日志确认：闹钟胶囊的类名是 CSProminentTextElementView。
+// 它在睡眠模式胶囊出现时才挂载到 CSProminentDisplayView 子树。
 static BOOL AxsHideAlarmPillIsTarget(NSString *cls) {
-    return [cls hasPrefix:@"CSProminent"] &&
-           ([cls containsString:@"Labeled"] ||
-            [cls containsString:@"Alarm"] ||
-            [cls containsString:@"Empty"]);
+    return [cls isEqualToString:@"CSProminentTextElementView"];
 }
 
 static void AxsHideAlarmPillCollect(UIView *view, NSMutableString *sig, NSMutableArray *found) {
@@ -57,7 +54,7 @@ static void AxsHideAlarmPillCollect(UIView *view, NSMutableString *sig, NSMutabl
     NSMutableArray *found = [NSMutableArray array];
     AxsHideAlarmPillCollect(self, sig, found);
 
-    // 视图树变化时记一次，便于确认闹钟胶囊的真实类名
+    // 视图树变化时记一次，便于确认隐藏是否命中
     NSString *old = objc_getAssociatedObject(self, &AxsHideAlarmPillSigKey);
     if (![old isEqualToString:sig]) {
         objc_setAssociatedObject(self, &AxsHideAlarmPillSigKey, sig, OBJC_ASSOCIATION_COPY_NONATOMIC);
@@ -74,13 +71,13 @@ static void AxsHideAlarmPillCollect(UIView *view, NSMutableString *sig, NSMutabl
 
 %end
 
-// 兜底：部分 iOS 版本胶囊不走 CSProminentDisplayView 子树
-%hook CSProminentLabeledElementView
+// 兜底：胶囊自身布局时直接隐藏，覆盖不走父视图遍历的情况
+%hook CSProminentTextElementView
 - (void)layoutSubviews {
     %orig;
     if (!self.hidden) {
         self.hidden = YES;
-        AxsHideAlarmPillWrite(@"hidden labeled-direct");
+        AxsHideAlarmPillWrite(@"hidden text-direct");
     }
 }
 %end
