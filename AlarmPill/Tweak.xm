@@ -4,8 +4,9 @@
 @interface SpringBoard : UIApplication
 @end
 
-// 稳健方案：不 hook 懒加载的 CSProminent* 私有类（注入时类未加载会静默失效），
-// 改为 hook 必定存在的 SpringBoard，定时遍历视图树直接操作目标视图。
+// 按「显示内容」定位闹钟胶囊：不再依赖类名（胶囊是可点击的独立控件，
+// 不在 CSProminentEmptyElementView 里）。每秒扫描所有视图，找到显示
+// HH:MM 的 UILabel，排除状态栏/大时间/日期/音乐进度后，隐藏其胶囊容器。
 static NSString *const AxsLogPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
 static NSTimer *AxsTimer = nil;
 
@@ -22,41 +23,94 @@ static void AxsWrite(NSString *msg) {
     }
 }
 
-// 递归遍历视图树，隐藏时间下方的闹钟槽位 CSProminentEmptyElementView。
-// 不碰 CSProminentTimeView（大时间）和 CSProminentSubtitleDateView（日期）。
-static void AxsHideSlotInTree(UIView *view, NSMutableString *log) {
-    NSString *cls = NSStringFromClass([view class]);
+// 判断文本是否形如 "07:24" / "7:24"（闹钟时间）
+static BOOL AxsIsTimeText(NSString *text) {
+    if (text.length < 4 || text.length > 8) return NO;
+    NSRange colon = [text rangeOfString:@":"];
+    if (colon.location == NSNotFound || colon.location == 0 ||
+        colon.location + 1 >= text.length) return NO;
+    NSString *hour = [text substringToIndex:colon.location];
+    NSString *minute = [[text substringFromIndex:colon.location + 1]
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (hour.length > 2 || minute.length != 2) return NO;
+    NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
+    if ([hour rangeOfCharacterFromSet:[digits invertedSet]].location != NSNotFound) return NO;
+    if ([minute rangeOfCharacterFromSet:[digits invertedSet]].location != NSNotFound) return NO;
+    return YES;
+}
 
-    if ([cls isEqualToString:@"CSProminentEmptyElementView"]) {
-        CGRect f = view.frame;
-        if (!view.hidden) {
-            view.hidden = YES;
-            [log appendFormat:@"HIDDEN slot f=(%.0f,%.0f,%.0f,%.0f)\n",
-                f.origin.x, f.origin.y, f.size.width, f.size.height];
+// 父链里是否含这些「不该动」的类：状态栏、大时间、日期、音乐进度
+static BOOL AxsParentChainHas(UIView *view, NSArray *keywords) {
+    UIView *cur = view.superview;
+    while (cur) {
+        NSString *cls = NSStringFromClass([cur class]);
+        for (NSString *kw in keywords) {
+            if ([cls rangeOfString:kw].location != NSNotFound) return YES;
         }
-        return;
+        cur = cur.superview;
     }
+    return NO;
+}
 
+static NSArray *AxsExcludeKeywords(void) {
+    static NSArray *kw = nil;
+    if (!kw) {
+        kw = @[@"STUIStatusBar", @"CSProminentTimeView",
+               @"CSProminentSubtitleDateView", @"LHHNowPlaying",
+               @"LockPlayer", @"GCpOYsFYFMebofGH"];
+    }
+    return kw;
+}
+
+// 从 label 向上找尺寸像「胶囊」的容器（宽 80-300，高 20-80）
+static UIView *AxsFindPillContainer(UILabel *label) {
+    UIView *cur = label;
+    for (NSInteger i = 0; i < 6 && cur.superview; i++) {
+        cur = cur.superview;
+        CGRect f = cur.frame;
+        if (f.size.width >= 80 && f.size.width <= 300 &&
+            f.size.height >= 20 && f.size.height <= 80) {
+            return cur;
+        }
+    }
+    return label.superview ?: label;
+}
+
+static void AxsScanAndHide(UIView *view, NSMutableString *log) {
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *text = ((UILabel *)view).text ?: @"";
+        if (AxsIsTimeText(text) && !AxsParentChainHas(view, AxsExcludeKeywords())) {
+            CGRect lf = [view convertRect:view.bounds toView:nil];
+            // 只处理屏幕上半部（闹钟胶囊在时间下方，约 y 150-420）
+            if (lf.origin.y >= 150 && lf.origin.y <= 420) {
+                UIView *pill = AxsFindPillContainer((UILabel *)view);
+                NSString *pillCls = NSStringFromClass([pill class]);
+                CGRect pf = [pill convertRect:pill.bounds toView:nil];
+                [log appendFormat:@"MATCH text='%@' label=%@ labelFrame=(%.0f,%.0f) pill=%@ pillFrame=(%.0f,%.0f,%.0f,%.0f)\n",
+                    text, NSStringFromClass([view class]), lf.origin.x, lf.origin.y,
+                    pillCls, pf.origin.x, pf.origin.y, pf.size.width, pf.size.height];
+                if (!pill.hidden) {
+                    pill.hidden = YES;
+                    [log appendFormat:@"HIDDEN %@ text='%@'\n", pillCls, text];
+                }
+            }
+        }
+    }
     for (UIView *sub in view.subviews) {
-        AxsHideSlotInTree(sub, log);
+        AxsScanAndHide(sub, log);
     }
 }
 
 static void AxsTick(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    NSMutableArray *windows = [NSMutableArray array];
+    NSMutableString *log = [NSMutableString string];
     for (UIScene *scene in app.connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            [windows addObjectsFromArray:((UIWindowScene *)scene).windows];
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+            if (w.hidden) continue;
+            AxsScanAndHide(w, log);
         }
     }
-
-    NSMutableString *log = [NSMutableString string];
-    for (UIWindow *w in windows) {
-        if (w.hidden) continue;
-        AxsHideSlotInTree(w, log);
-    }
-
     if (log.length) AxsWrite(log);
 }
 
@@ -64,7 +118,7 @@ static void AxsTick(void) {
 
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    AxsWrite(@"=== tweak loaded ===");
+    AxsWrite(@"=== tweak loaded (content-based v1) ===");
     if (!AxsTimer) {
         AxsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                                    repeats:YES
