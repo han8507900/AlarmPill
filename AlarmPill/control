@@ -1,0 +1,8 @@
+Package: com.yourname.alarmpill
+Name: AlarmPill Probe
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: Diagnostic probe to dump iOS 17 lock screen alarm pill view hierarchy (RootHide).
+Maintainer: YourName
+Author: YourName
+Section: Tweaks
