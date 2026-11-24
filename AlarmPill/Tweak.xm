@@ -1,83 +1,123 @@
 #import <UIKit/UIKit.h>
 #include <objc/runtime.h>
 
-// 显式声明被 hook 的私有类继承自 UIView。
-// Logos 默认只生成 @class 前向声明，编译器不知道它们的父类，
-// 会导致「无法作为 UIView* 传参」和「找不到 hidden 属性」两类编译错误。
-@interface CSProminentDisplayView : UIView
+@interface SpringBoard : UIApplication
 @end
 
-@interface CSProminentTextElementView : UIView
-@end
+// 只读探针：不隐藏任何视图。扫描屏幕上所有「看起来像时间」的文字标签
+// （含冒号数字或闹钟符号），记录其类名、frame 与完整父视图链，
+// 用于精确定位睡眠模式锁屏上的闹钟胶囊视图。
+static NSString *const AxsProbeLogPath = @"/var/mobile/Documents/AxsAlarmPillProbe.log";
 
-static NSString *const AxsHideAlarmPillLogPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
-static char AxsHideAlarmPillSigKey;
-
-static void AxsHideAlarmPillWrite(NSString *msg) {
+static void AxsProbeWrite(NSString *msg) {
     NSString *line = [msg stringByAppendingString:@"\n"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsHideAlarmPillLogPath];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsProbeLogPath];
     if (fh) {
         [fh seekToEndOfFile];
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     } else {
-        [line writeToFile:AxsHideAlarmPillLogPath atomically:YES
+        [line writeToFile:AxsProbeLogPath atomically:YES
                  encoding:NSUTF8StringEncoding error:nil];
     }
 }
 
-// 真机日志确认：闹钟胶囊的类名是 CSProminentTextElementView。
-// 它在睡眠模式胶囊出现时才挂载到 CSProminentDisplayView 子树。
-static BOOL AxsHideAlarmPillIsTarget(NSString *cls) {
-    return [cls isEqualToString:@"CSProminentTextElementView"];
+static NSString *AxsProbeText(UIView *view) {
+    if ([view isKindOfClass:[UILabel class]]) {
+        return ((UILabel *)view).text ?: @"";
+    }
+    return @"";
 }
 
-static void AxsHideAlarmPillCollect(UIView *view, NSMutableString *sig, NSMutableArray *found) {
-    NSString *cls = NSStringFromClass([view class]);
-    if ([cls hasPrefix:@"CSProminent"]) {
-        [sig appendFormat:@"%@,", cls];
-    }
-    if (AxsHideAlarmPillIsTarget(cls)) {
-        [found addObject:view];
+static BOOL AxsProbeIsTimeLike(NSString *text) {
+    if (text.length == 0) return NO;
+    if ([text containsString:@"⏰"] || [text containsString:@"闹"]) return YES;
+    NSRange colon = [text rangeOfString:@":"];
+    if (colon.location == NSNotFound || colon.location == 0) return NO;
+    NSString *head = [text substringToIndex:colon.location];
+    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    return head.length > 0 && [head rangeOfCharacterFromSet:nonDigits].location == NSNotFound;
+}
+
+static void AxsProbeScanView(UIView *view, NSMutableString *out) {
+    NSString *text = AxsProbeText(view);
+    if (AxsProbeIsTimeLike(text)) {
+        NSMutableString *chain = [NSMutableString string];
+        UIView *cur = view;
+        while (cur) {
+            CGRect f = cur.frame;
+            [chain appendFormat:@"%@(%.0f,%.0f,%.0f,%.0f,'%@') < ",
+                NSStringFromClass([cur class]), f.origin.x, f.origin.y,
+                f.size.width, f.size.height, AxsProbeText(cur)];
+            cur = cur.superview;
+        }
+        [out appendFormat:@"CANDIDATE: %@\n", chain];
     }
     for (UIView *sub in view.subviews) {
-        AxsHideAlarmPillCollect(sub, sig, found);
+        AxsProbeScanView(sub, out);
     }
 }
 
-%hook CSProminentDisplayView
-
-- (void)layoutSubviews {
-    %orig;
-
-    NSMutableString *sig = [NSMutableString string];
-    NSMutableArray *found = [NSMutableArray array];
-    AxsHideAlarmPillCollect(self, sig, found);
-
-    // 视图树变化时记一次，便于确认隐藏是否命中
-    NSString *old = objc_getAssociatedObject(self, &AxsHideAlarmPillSigKey);
-    if (![old isEqualToString:sig]) {
-        objc_setAssociatedObject(self, &AxsHideAlarmPillSigKey, sig, OBJC_ASSOCIATION_COPY_NONATOMIC);
-        AxsHideAlarmPillWrite([NSString stringWithFormat:@"tree: %@", sig]);
+// 区域扫描：胶囊位于屏幕中部（393x852 下大致 x 100-300 / y 250-520）。
+// 即使文字是绘制的、不是 UILabel，也能靠坐标把这个视图抓出来。
+static void AxsProbeScanRegion(UIView *view, NSMutableString *out) {
+    CGRect f = view.frame;
+    BOOL inVerticalBand = (f.origin.y >= 120 && f.origin.y <= 560);
+    BOOL pillSized = (f.size.width >= 80 && f.size.width <= 300 &&
+                      f.size.height >= 20 && f.size.height <= 90);
+    if (inVerticalBand && pillSized) {
+        [out appendFormat:@"REGION %@ frame=(%.0f,%.0f,%.0f,%.0f) text='%@'\n",
+            NSStringFromClass([view class]), f.origin.x, f.origin.y,
+            f.size.width, f.size.height, AxsProbeText(view)];
     }
+    for (UIView *sub in view.subviews) {
+        AxsProbeScanRegion(sub, out);
+    }
+}
 
-    for (UIView *v in found) {
-        if (!v.hidden) {
-            v.hidden = YES;
-            AxsHideAlarmPillWrite([NSString stringWithFormat:@"hidden %@", NSStringFromClass([v class])]);
+static void AxsProbeDump(void) {
+    NSMutableString *out = [NSMutableString stringWithString:@"=== alarm pill probe ===\n"];
+
+    UIApplication *app = [UIApplication sharedApplication];
+    NSMutableArray *windows = [NSMutableArray array];
+    for (UIScene *scene in app.connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            [windows addObjectsFromArray:((UIWindowScene *)scene).windows];
         }
     }
-}
 
-%end
-
-// 兜底：胶囊自身布局时直接隐藏，覆盖不走父视图遍历的情况
-%hook CSProminentTextElementView
-- (void)layoutSubviews {
-    %orig;
-    if (!self.hidden) {
-        self.hidden = YES;
-        AxsHideAlarmPillWrite(@"hidden text-direct");
+    for (UIWindow *w in windows) {
+        if (w.hidden) continue;
+        [out appendFormat:@"WINDOW %@\n", NSStringFromClass([w class])];
+        AxsProbeScanView(w, out);
+        AxsProbeScanRegion(w, out);
     }
+
+    [out appendString:@"=== end ===\n"];
+    AxsProbeWrite(out);
 }
+
+static void AxsProbeOnLock(CFNotificationCenterRef center, void *observer,
+                           CFStringRef name, const void *object,
+                           CFDictionaryRef userInfo) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ AxsProbeDump(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{ AxsProbeDump(); });
+}
+
+%hook SpringBoard
+
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL,
+        &AxsProbeOnLock,
+        CFSTR("com.apple.springboard.lockcomplete"),
+        NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately
+    );
+}
+
 %end
