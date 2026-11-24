@@ -1,18 +1,13 @@
 #import <UIKit/UIKit.h>
 #include <objc/runtime.h>
 
-// 显式声明被 hook 的私有类继承自 UIView（Logos 默认只生成 @class，编译会报错）
-@interface CSProminentDisplayView : UIView
-@end
-@interface CSProminentEmptyElementView : UIView
+@interface SpringBoard : UIApplication
 @end
 
-// 真机完整视图树确认：
-//   CSProminentTimeView          → 大时间
-//   CSProminentSubtitleDateView  → 日期
-//   CSProminentEmptyElementView  → 时间下方槽位(y=140,h=72)，闹钟胶囊装在这里
-// TextElementView 是时间本身，不能碰（上次误伤导致时间消失）。
+// 稳健方案：不 hook 懒加载的 CSProminent* 私有类（注入时类未加载会静默失效），
+// 改为 hook 必定存在的 SpringBoard，定时遍历视图树直接操作目标视图。
 static NSString *const AxsLogPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
+static NSTimer *AxsTimer = nil;
 
 static void AxsWrite(NSString *msg) {
     NSString *line = [msg stringByAppendingString:@"\n"];
@@ -27,60 +22,56 @@ static void AxsWrite(NSString *msg) {
     }
 }
 
-static void AxsDescribe(UIView *view, NSInteger depth, NSMutableString *out) {
-    NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2) withString:@" " startingAtIndex:0];
-    CGRect f = view.frame;
-    NSString *text = @"";
-    if ([view isKindOfClass:[UILabel class]]) text = ((UILabel *)view).text ?: @"";
-    [out appendFormat:@"%@%@ f=(%.0f,%.0f,%.0f,%.0f) t='%@'\n",
-        pad, NSStringFromClass([view class]), f.origin.x, f.origin.y,
-        f.size.width, f.size.height, text];
-    for (UIView *sub in view.subviews) {
-        AxsDescribe(sub, depth + 1, out);
-    }
-}
-
-// 在 DisplayView 子树中找到闹钟槽位，隐藏它，并记录它装了什么内容
-static void AxsHideAlarmSlot(UIView *view, NSMutableString *log) {
+// 递归遍历视图树，隐藏时间下方的闹钟槽位 CSProminentEmptyElementView。
+// 不碰 CSProminentTimeView（大时间）和 CSProminentSubtitleDateView（日期）。
+static void AxsHideSlotInTree(UIView *view, NSMutableString *log) {
     NSString *cls = NSStringFromClass([view class]);
+
     if ([cls isEqualToString:@"CSProminentEmptyElementView"]) {
+        CGRect f = view.frame;
         if (!view.hidden) {
             view.hidden = YES;
-            [log appendString:@"hidden via tree: CSProminentEmptyElementView\n"];
-            [log appendString:@"slot content:\n"];
-            AxsDescribe(view, 1, log);
+            [log appendFormat:@"HIDDEN slot f=(%.0f,%.0f,%.0f,%.0f)\n",
+                f.origin.x, f.origin.y, f.size.width, f.size.height];
         }
         return;
     }
+
     for (UIView *sub in view.subviews) {
-        AxsHideAlarmSlot(sub, log);
+        AxsHideSlotInTree(sub, log);
     }
 }
 
-%hook CSProminentDisplayView
+static void AxsTick(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    NSMutableArray *windows = [NSMutableArray array];
+    for (UIScene *scene in app.connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            [windows addObjectsFromArray:((UIWindowScene *)scene).windows];
+        }
+    }
 
-- (void)layoutSubviews {
-    %orig;
     NSMutableString *log = [NSMutableString string];
-    AxsHideAlarmSlot(self, log);
+    for (UIWindow *w in windows) {
+        if (w.hidden) continue;
+        AxsHideSlotInTree(w, log);
+    }
+
     if (log.length) AxsWrite(log);
 }
 
-%end
+%hook SpringBoard
 
-%hook CSProminentEmptyElementView
-
-- (void)layoutSubviews {
+- (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    if (!self.hidden) {
-        self.hidden = YES;
-        AxsWrite(@"hidden via self layout");
+    AxsWrite(@"=== tweak loaded ===");
+    if (!AxsTimer) {
+        AxsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                   repeats:YES
+                                                     block:^(NSTimer *timer) {
+            AxsTick();
+        }];
     }
-}
-
-// 强制该槽位永远保持隐藏，防止系统或其他 tweak 把它设回显示
-- (void)setHidden:(BOOL)hidden {
-    %orig(YES);
 }
 
 %end
