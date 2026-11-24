@@ -4,10 +4,12 @@
 @interface SpringBoard : UIApplication
 @end
 
-// 只读探针：不隐藏任何视图。扫描屏幕上所有「看起来像时间」的文字标签
-// （含冒号数字或闹钟符号），记录其类名、frame 与完整父视图链，
-// 用于精确定位睡眠模式锁屏上的闹钟胶囊视图。
+// 持续监控探针：每 2 秒扫描一次，完整 dump 锁屏时钟区（CSProminent*）视图树。
+// 只要视图结构发生变化（例如闹钟胶囊出现）就写入日志，不依赖锁屏时机。
+// 只读，不隐藏任何视图。
 static NSString *const AxsProbeLogPath = @"/var/mobile/Documents/AxsAlarmPillProbe.log";
+static NSString *AxsProbeLastSig = nil;
+static NSTimer *AxsProbeTimer = nil;
 
 static void AxsProbeWrite(NSString *msg) {
     NSString *line = [msg stringByAppendingString:@"\n"];
@@ -29,54 +31,44 @@ static NSString *AxsProbeText(UIView *view) {
     return @"";
 }
 
-static BOOL AxsProbeIsTimeLike(NSString *text) {
-    if (text.length == 0) return NO;
-    if ([text containsString:@"⏰"] || [text containsString:@"闹"]) return YES;
-    NSRange colon = [text rangeOfString:@":"];
-    if (colon.location == NSNotFound || colon.location == 0) return NO;
-    NSString *head = [text substringToIndex:colon.location];
-    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-    return head.length > 0 && [head rangeOfCharacterFromSet:nonDigits].location == NSNotFound;
-}
-
-static void AxsProbeScanView(UIView *view, NSMutableString *out) {
-    NSString *text = AxsProbeText(view);
-    if (AxsProbeIsTimeLike(text)) {
-        NSMutableString *chain = [NSMutableString string];
-        UIView *cur = view;
-        while (cur) {
-            CGRect f = cur.frame;
-            [chain appendFormat:@"%@(%.0f,%.0f,%.0f,%.0f,'%@') < ",
-                NSStringFromClass([cur class]), f.origin.x, f.origin.y,
-                f.size.width, f.size.height, AxsProbeText(cur)];
-            cur = cur.superview;
-        }
-        [out appendFormat:@"CANDIDATE: %@\n", chain];
-    }
-    for (UIView *sub in view.subviews) {
-        AxsProbeScanView(sub, out);
-    }
-}
-
-// 区域扫描：胶囊位于屏幕中部（393x852 下大致 x 100-300 / y 250-520）。
-// 即使文字是绘制的、不是 UILabel，也能靠坐标把这个视图抓出来。
-static void AxsProbeScanRegion(UIView *view, NSMutableString *out) {
+// 递归 dump 一棵子树，同时用类名序列累积结构签名
+static void AxsProbeSubtree(UIView *view, NSInteger depth, NSMutableString *out, NSMutableString *sig) {
+    NSString *cls = NSStringFromClass([view class]);
     CGRect f = view.frame;
-    BOOL inVerticalBand = (f.origin.y >= 120 && f.origin.y <= 560);
-    BOOL pillSized = (f.size.width >= 80 && f.size.width <= 300 &&
-                      f.size.height >= 20 && f.size.height <= 90);
-    if (inVerticalBand && pillSized) {
-        [out appendFormat:@"REGION %@ frame=(%.0f,%.0f,%.0f,%.0f) text='%@'\n",
-            NSStringFromClass([view class]), f.origin.x, f.origin.y,
-            f.size.width, f.size.height, AxsProbeText(view)];
+    NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2) withString:@" " startingAtIndex:0];
+    [out appendFormat:@"%@%@ f=(%.0f,%.0f,%.0f,%.0f) h=%d t='%@'\n",
+        pad, cls, f.origin.x, f.origin.y, f.size.width, f.size.height,
+        view.hidden, AxsProbeText(view)];
+    if ([cls hasPrefix:@"CSProminent"] ||
+        [cls rangeOfString:@"Alarm"].location != NSNotFound ||
+        [cls rangeOfString:@"Sleep"].location != NSNotFound) {
+        [sig appendFormat:@"%@;", cls];
     }
     for (UIView *sub in view.subviews) {
-        AxsProbeScanRegion(sub, out);
+        AxsProbeSubtree(sub, depth + 1, out, sig);
+    }
+}
+
+// 找到最外层的 CSProminent* 视图作为根，dump 其完整子树
+static void AxsProbeClockTrees(UIView *view, NSMutableString *out, NSMutableString *sig) {
+    NSString *cls = NSStringFromClass([view class]);
+    NSString *parentCls = view.superview ? NSStringFromClass([view.superview class]) : @"";
+    if ([cls hasPrefix:@"CSProminent"] && ![parentCls hasPrefix:@"CSProminent"]) {
+        [out appendFormat:@"--- CLOCK TREE (%@) ---\n", cls];
+        AxsProbeSubtree(view, 0, out, sig);
+    }
+    for (UIView *sub in view.subviews) {
+        AxsProbeClockTrees(sub, out, sig);
     }
 }
 
 static void AxsProbeDump(void) {
-    NSMutableString *out = [NSMutableString stringWithString:@"=== alarm pill probe ===\n"];
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.dateFormat = @"HH:mm:ss";
+    NSString *now = [fmt stringFromDate:[NSDate date]];
+
+    NSMutableString *out = [NSMutableString stringWithFormat:@"=== probe %@ ===\n", now];
+    NSMutableString *sig = [NSMutableString string];
 
     UIApplication *app = [UIApplication sharedApplication];
     NSMutableArray *windows = [NSMutableArray array];
@@ -88,36 +80,33 @@ static void AxsProbeDump(void) {
 
     for (UIWindow *w in windows) {
         if (w.hidden) continue;
-        [out appendFormat:@"WINDOW %@\n", NSStringFromClass([w class])];
-        AxsProbeScanView(w, out);
-        AxsProbeScanRegion(w, out);
+        AxsProbeClockTrees(w, out, sig);
     }
 
-    [out appendString:@"=== end ===\n"];
-    AxsProbeWrite(out);
-}
-
-static void AxsProbeOnLock(CFNotificationCenterRef center, void *observer,
-                           CFStringRef name, const void *object,
-                           CFDictionaryRef userInfo) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{ AxsProbeDump(); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{ AxsProbeDump(); });
+    // 只在结构签名变化（胶囊出现/消失）时写日志，避免刷屏
+    if (![sig isEqualToString:AxsProbeLastSig]) {
+        AxsProbeLastSig = [sig copy];
+        [out appendFormat:@"SIG %@\n", sig];
+        [out appendString:@"=== end ===\n"];
+        AxsProbeWrite(out);
+    }
 }
 
 %hook SpringBoard
 
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    CFNotificationCenterAddObserver(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        NULL,
-        &AxsProbeOnLock,
-        CFSTR("com.apple.springboard.lockcomplete"),
-        NULL,
-        CFNotificationSuspensionBehaviorDeliverImmediately
-    );
+    // 每次 respring 清空旧日志
+    [@"" writeToFile:AxsProbeLogPath atomically:YES
+            encoding:NSUTF8StringEncoding error:nil];
+    AxsProbeLastSig = nil;
+    if (!AxsProbeTimer) {
+        AxsProbeTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                        repeats:YES
+                                                          block:^(NSTimer *timer) {
+            AxsProbeDump();
+        }];
+    }
 }
 
 %end
