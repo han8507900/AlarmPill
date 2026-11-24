@@ -7,6 +7,6 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = AlarmPill
 AlarmPill_FILES = Tweak.xm
-AlarmPill_CFLAGS = -fobjc-arc
+AlarmPill_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
 include $(THEOS_MAKE_PATH)/tweak.mk
