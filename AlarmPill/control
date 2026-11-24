@@ -1,8 +1,8 @@
 Package: com.yourname.alarmpill
-Name: Hide Sleep Alarm Pill
+Name: 隐藏睡眠闹钟胶囊
 Version: 0.0.2
 Architecture: iphoneos-arm64
-Description: Hide the lock screen sleep alarm pill below the clock on iOS 17 (RootHide).
-Maintainer: YourName
-Author: YourName
+Description: 隐藏 iOS 17 锁屏时间下方、睡眠模式下显示的闹钟胶囊，不影响时间和日期。适用于 RootHide 隐根环境。
+Maintainer: hzy
+Author: hzy
 Section: Tweaks
