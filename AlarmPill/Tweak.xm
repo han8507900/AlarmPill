@@ -4,25 +4,49 @@
 @end
 
 // ============================================================================
-// 方案 v4：点击触发（诊断 + 高置信度隐藏 二合一）
+// 方案 v5：全锁屏持续扫描（不再局限于时钟区，不再靠点击时机）
 //
-// 为什么改架构：之前的定时扫描在锁屏熄屏时会被系统暂停，解锁后定时器才
-// 恢复、但那时胶囊已经消失，所以从来没抓到过真正的闹钟胶囊。
+// 教训：
+//  1) 之前只 dump CSProminentDisplayView（时钟区），但闹钟胶囊挂在 CoverSheet
+//     的其他容器下（本次抓到的是 LockPlayerContainerView / CSFixedFooterView 那棵）。
+//  2) 点击后延迟抓取会抓到"锁屏上滑收起"的负坐标状态。
+//  3) 定时扫描在熄屏时被暂停——但屏幕亮着（用户看胶囊）时定时器是运行的。
 //
-// 新方案：监听 SpringBoard 的 sendEvent:，锁屏上每次点击都抓取整棵视图树。
-//   1) 高置信度隐藏：只隐藏类名明确含 Alarm/Wake/Sleep/Bedtime 的视图。
-//      这些词和时间视图（CSProminentTimeView / TextElementView）无关，绝不会误伤时间。
-//   2) 完整诊断：把整棵树写文件，关键视图写剪贴板，一次拿到胶囊真实类名。
-// 这样要么这次直接解决，要么一次拿到确切数据精准收尾。
+// 新方案：屏幕亮且锁屏时，每 0.5s 扫描整个 SBCoverSheetWindow 的所有视图，
+//   自动标记出"显示时间格式文字"或"含闹钟语义类名"的视图。
+//   结构变化时才追加写日志（避免刷屏），同时把命中行写到剪贴板。
+//   这样只要胶囊在锁屏上显示几秒，就一定会被抓到。
 // ============================================================================
 
-static NSString *const AxsTapLogPath = @"/var/mobile/Documents/AxsTapDump.txt";
-static NSString *const AxsMarkPath   = @"/var/mobile/Documents/AxsHideAlarmPill.log";
-static CFAbsoluteTime sLastDump = 0;
-static NSInteger sDumpCount = 0;
-static BOOL sWasLockScreen = NO;
+static NSString *const AxsDumpPath = @"/var/mobile/Documents/AxsCoverSheetDump.txt";
+static NSString *const AxsMarkPath = @"/var/mobile/Documents/AxsHideAlarmPill.log";
+static dispatch_source_t AxsTimerSource = nil;
+static NSString *AxsLastSig = nil;
 
-// 收集视图上所有显示文本（含无障碍标签——可点击控件通常有）
+static void AxsWriteMark(NSString *line) {
+    NSString *s = [line stringByAppendingString:@"\n"];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsMarkPath];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [s writeToFile:AxsMarkPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+static void AxsAppendDump(NSString *text) {
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsDumpPath];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[text dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [text writeToFile:AxsDumpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+// 视图上所有显示文本
 static NSString *AxsViewText(UIView *v) {
     NSMutableArray *parts = [NSMutableArray array];
     if ([v isKindOfClass:[UILabel class]]) {
@@ -45,171 +69,132 @@ static NSString *AxsViewText(UIView *v) {
     return [parts componentsJoinedByString:@" "];
 }
 
-// 高置信度关键词：这些类必然是闹钟相关，和时间视图无关，可以安全隐藏
-static BOOL AxsSafeHideKeyword(NSString *cls) {
+// 文本里是否含 HH:MM / H:MM 时间格式（闹钟时间）
+static BOOL AxsHasTime(NSString *s) {
+    if (s.length < 3) return NO;
+    NSRange colon = [s rangeOfString:@":"];
+    if (colon.location == NSNotFound || colon.location == 0 || colon.location + 2 >= s.length) return NO;
+    NSCharacterSet *d = [NSCharacterSet decimalDigitCharacterSet];
+    unichar before = [s characterAtIndex:colon.location - 1];
+    unichar after  = [s characterAtIndex:colon.location + 1];
+    return [d characterIsMember:before] && [d characterIsMember:after];
+}
+
+// 类名是否含闹钟语义
+static BOOL AxsAlarmName(NSString *cls) {
     NSString *low = [cls lowercaseString];
     return [low rangeOfString:@"alarm"].location != NSNotFound ||
            [low rangeOfString:@"wake"].location != NSNotFound ||
-           [low rangeOfString:@"bedtime"].location != NSNotFound ||
-           [low rangeOfString:@"sleep"].location != NSNotFound;
+           [low rangeOfString:@"bedtime"].location != NSNotFound;
 }
 
-// 记录用关键词（范围更宽，只为定位，不用于隐藏）
-static BOOL AxsNoteKeyword(NSString *cls, NSString *txt) {
-    NSString *all = [NSString stringWithFormat:@"%@ %@", cls, txt];
-    NSString *low = [all lowercaseString];
-    if (AxsSafeHideKeyword(cls)) return YES;
-    return [low rangeOfString:@"clock"].location != NSNotFound ||
-           [low rangeOfString:@"next"].location != NSNotFound;
-}
-
-// 记录父视图链，便于从命中视图反推它属于哪一棵子树
 static NSString *AxsParentChain(UIView *v) {
-    NSMutableArray *names = [NSMutableArray array];
+    NSMutableArray *a = [NSMutableArray array];
     UIView *cur = v.superview;
     int n = 0;
-    while (cur && n++ < 7) {
-        [names addObject:NSStringFromClass([cur class])];
+    while (cur && n++ < 8) {
+        [a addObject:NSStringFromClass([cur class])];
         cur = cur.superview;
     }
-    return [names componentsJoinedByString:@" < "];
+    return [a componentsJoinedByString:@" < "];
 }
 
-static void AxsWriteMark(NSString *line) {
-    NSString *s = [line stringByAppendingString:@"\n"];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:AxsMarkPath];
-    if (fh) {
-        [fh seekToEndOfFile];
-        [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } else {
-        [s writeToFile:AxsMarkPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-}
-
-static NSInteger AxsWalk(UIView *v, NSInteger depth, NSMutableString *full,
-                         NSMutableString *brief, NSMutableArray *toHide) {
+static void AxsWalk(UIView *v, int depth, NSMutableString *full,
+                    NSMutableString *hits, NSMutableString *sig, int *hitCount) {
     NSString *cls = NSStringFromClass([v class]);
     NSString *txt = AxsViewText(v);
     CGRect f = [v convertRect:v.bounds toView:nil];
-    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
+    NSString *pad = [@"" stringByPaddingToLength:depth withString:@" " startingAtIndex:0];
 
-    BOOL safeHide = AxsSafeHideKeyword(cls);
-    BOOL note = AxsNoteKeyword(cls, txt) || safeHide;
-    NSString *mark = safeHide ? @"[HIDE] " : (note ? @"[NOTE] " : @"       ");
-    NSString *line = [NSString stringWithFormat:@"%@%@%@ f=(%.0f,%.0f,%.0f,%.0f) hid=%d tap=%lu %@\n",
-                      pad, mark, cls, f.origin.x, f.origin.y, f.size.width, f.size.height,
-                      v.hidden, (unsigned long)v.gestureRecognizers.count, txt];
+    BOOL timeText = AxsHasTime(txt);
+    BOOL alarmName = AxsAlarmName(cls);
+    BOOL mark = timeText || alarmName;
+
+    NSString *line = [NSString stringWithFormat:@"%@%@%@ f=(%.0f,%.0f,%.0f,%.0f) hid=%d %@\n",
+                      pad, mark ? @"★ " : @"  ", cls,
+                      f.origin.x, f.origin.y, f.size.width, f.size.height, v.hidden, txt];
     [full appendString:line];
-    if (note) {
-        [brief appendString:line];
-        [brief appendFormat:@"%@  PARENT: %@\n", pad, AxsParentChain(v)];
-    }
+    [sig appendFormat:@"%@|%@|%@;", cls, NSStringFromCGRect(f), txt];
 
-    NSInteger count = note ? 1 : 0;
-    if (safeHide && !v.hidden) [toHide addObject:v];
+    if (mark) {
+        (*hitCount)++;
+        [hits appendString:line];
+        [hits appendFormat:@"%@   CHAIN: %@\n", pad, AxsParentChain(v)];
+    }
 
     for (UIView *sub in v.subviews) {
-        count += AxsWalk(sub, depth + 1, full, brief, toHide);
+        AxsWalk(sub, depth + 1, full, hits, sig, hitCount);
     }
-    return count;
 }
 
-static void AxsDumpNow(UIView *tapped) {
-    sDumpCount++;
-    NSMutableString *full = [NSMutableString stringWithFormat:@"=== TAP DUMP #%ld (v4) ===\n", (long)sDumpCount];
-    NSMutableString *brief = [NSMutableString stringWithFormat:@"=== KEY VIEWS #%ld ===\n", (long)sDumpCount];
-    NSMutableArray *toHide = [NSMutableArray array];
-
-    // 【最关键】手指直接点到的那个 view —— 如果点的是胶囊，它就是胶囊本身
-    if (tapped) {
-        [brief appendFormat:@"\n>>>>>> TAPPED VIEW: %@\n", NSStringFromClass([tapped class])];
-        [brief appendFormat:@">>>>>> TAPPED TEXT: %@\n", AxsViewText(tapped)];
-        [brief appendFormat:@">>>>>> TAPPED FRAME: %@\n", NSStringFromCGRect([tapped convertRect:tapped.bounds toView:nil])];
-        [brief appendFormat:@">>>>>> TAPPED CHAIN: %@\n", AxsParentChain(tapped)];
-        // 从点击点向上找最近的可点击容器（胶囊按钮本体通常在更上层）
-        UIView *cur = tapped;
-        for (int i = 0; i < 5 && cur.superview; i++) {
-            cur = cur.superview;
-            [brief appendFormat:@">>>>>> ANCESTOR[%d]: %@ frame=%@\n",
-                i + 1, NSStringFromClass([cur class]),
-                NSStringFromCGRect([cur convertRect:cur.bounds toView:nil])];
-        }
-        [brief appendString:@"\n"];
-    }
-
+static void AxsTick(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    for (UIScene *scene in app.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+
+    // 只在屏幕亮着且锁屏（有可见 CoverSheet）时扫描
+    UIWindow *cover = nil;
+    for (UIScene *sc in app.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
             if (w.hidden) continue;
-            [full appendFormat:@"WINDOW %@\n", NSStringFromClass([w class])];
-            AxsWalk(w, 1, full, brief, toHide);
+            NSString *cls = NSStringFromClass([w class]);
+            if ([cls rangeOfString:@"CoverSheet"].location != NSNotFound) { cover = w; break; }
         }
+        if (cover) break;
     }
-    [full appendString:@"=== END ===\n"];
-    [full writeToFile:AxsTapLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [UIPasteboard generalPasteboard].string = brief;
+    if (!cover) return;
 
-    // 高置信度隐藏：只动 Alarm/Wake/Sleep/Bedtime 类，时间/日期视图绝不碰
-    for (UIView *v in toHide) {
-        v.hidden = YES;
-        AxsWriteMark([NSString stringWithFormat:@"HIDDEN %@ f=(%.0f,%.0f,%.0f,%.0f)",
-                      NSStringFromClass([v class]), v.frame.origin.x, v.frame.origin.y,
-                      v.frame.size.width, v.frame.size.height]);
-    }
-    AxsWriteMark([NSString stringWithFormat:@"dump#%ld noteViews=%lu hidden=%lu",
-                  (long)sDumpCount, (unsigned long)brief.length, (unsigned long)toHide.count]);
+    NSMutableString *full = [NSMutableString string];
+    NSMutableString *hits = [NSMutableString string];
+    NSMutableString *sig  = [NSMutableString string];
+    int hitCount = 0;
+    [full appendString:@"=== COVERSHEET SCAN ===\n"];
+    AxsWalk(cover, 1, full, hits, sig, &hitCount);
+    [full appendString:@"=== END ===\n"];
+
+    // 结构没变化就不重复写
+    if ([AxsLastSig isEqualToString:sig]) return;
+    AxsLastSig = [sig copy];
+
+    NSMutableString *block = [NSMutableString string];
+    [block appendFormat:@"\n########## SCAN hit=%d ##########\n", hitCount];
+    [block appendString:full];
+    AxsAppendDump(block);
+
+    // 写剪贴板：命中放前面，后面附完整树，无论如何都能拿到数据
+    NSMutableString *clip = [NSMutableString string];
+    [clip appendFormat:@"=== 闹钟候选 hit=%d ===\n", hitCount];
+    [clip appendString:hits];
+    [clip appendString:@"\n=== 完整树(最后一片) ===\n"];
+    [clip appendString:full];
+    [UIPasteboard generalPasteboard].string = clip;
 }
 
-// 判断当前是否在锁屏（主屏隐藏 + CoverSheet 可见）
-static BOOL AxsLockScreenVisible(void) {
-    UIApplication *app = [UIApplication sharedApplication];
-    BOOL homeHidden = NO, coverVisible = NO;
-    for (UIScene *scene in app.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-            NSString *cls = NSStringFromClass([w class]);
-            if ([cls rangeOfString:@"SBHomeScreenWindow"].location != NSNotFound && w.hidden) {
-                homeHidden = YES;
-            }
-            if (!w.hidden && [cls rangeOfString:@"CoverSheet"].location != NSNotFound) {
-                coverVisible = YES;
-            }
-        }
-    }
-    return homeHidden && coverVisible;
+// 主队列 GCD 定时器：不受 run loop mode 切换影响（NSTimer 在锁屏/滚动时会被
+// 切到 UITrackingRunLoopMode 而暂停），同时保证 UIKit 操作都在主线程。
+static void AxsStartScan(void) {
+    if (AxsTimerSource) return;
+    AxsTimerSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                            dispatch_get_main_queue());
+    dispatch_source_set_timer(AxsTimerSource,
+                              dispatch_walltime(NULL, 0),
+                              500 * NSEC_PER_MSEC,   // 每 0.5 秒
+                              100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(AxsTimerSource, ^{
+        AxsTick();
+    });
+    dispatch_resume(AxsTimerSource);
 }
 
 %hook SpringBoard
 
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    AxsWriteMark(@"=== tweak v4 loaded (tap-trigger) ===");
-}
-
-- (void)sendEvent:(UIEvent *)event {
-    %orig;
-    if (event.type != UIEventTypeTouches) return;
-
-    // 在点击这一刻判断锁屏状态并存下来（避免延迟后状态已变）
-    if (AxsLockScreenVisible()) sWasLockScreen = YES;
-
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - sLastDump < 0.4) return;
-    sLastDump = now;
-
-    BOOL wasLocked = sWasLockScreen;
-    sWasLockScreen = NO;
-
-    if (!wasLocked) return;
-
-    // 抓住这次点击的 touch view（在 %orig 之后它已被 hitTest 确定）
-    UIView *tappedView = [[[event allTouches] anyObject] view];
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+    // respring 时清空旧日志
+    [@"" writeToFile:AxsDumpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    AxsWriteMark(@"=== tweak v5 loaded (gcd coversheet scan) ===");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        AxsDumpNow(tappedView);
+        AxsStartScan();
     });
 }
 
